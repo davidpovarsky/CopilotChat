@@ -1,0 +1,157 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ios-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-unsigned-ipa:
+    name: Build CopilotChat unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    env:
+      SCHEME: CopilotChat
+      CONFIGURATION: Release
+      DERIVED_DATA: ${{ github.workspace }}/DerivedData
+      BUILD_LOGS: ${{ github.workspace }}/BuildLogs
+      OUTPUT_DIR: ${{ github.workspace }}/Artifacts
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          XCODE_PATH="$(
+            find /Applications -maxdepth 1 -type d -name 'Xcode*.app' ! -iname '*beta*' -print |
+              sort -V |
+              tail -n 1
+          )"
+
+          if [[ -z "$XCODE_PATH" ]]; then
+            echo "::error::No stable Xcode installation was found."
+            exit 1
+          fi
+
+          sudo xcode-select --switch "$XCODE_PATH/Contents/Developer"
+          echo "Selected Xcode: $XCODE_PATH"
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Record build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_LOGS" "$OUTPUT_DIR"
+
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Runner: $RUNNER_OS / $RUNNER_ARCH"
+            echo "Scheme: $SCHEME"
+            echo "Configuration: $CONFIGURATION"
+            echo
+            xcodebuild -version
+            echo
+            xcodebuild -showsdks
+            echo
+            swift --version
+            echo
+            system_profiler SPSoftwareDataType
+          } | tee "$BUILD_LOGS/environment.log"
+
+      - name: Inspect Xcode project
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild             -project CopilotChat.xcodeproj             -list             2>&1 | tee "$BUILD_LOGS/xcodebuild-list.log"
+
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild             -resolvePackageDependencies             -project CopilotChat.xcodeproj             -scheme "$SCHEME"             2>&1 | tee "$BUILD_LOGS/package-resolution.log"
+
+      - name: Build unsigned iOS app
+        shell: bash
+        run: |
+          set -o pipefail
+
+          xcodebuild             -project CopilotChat.xcodeproj             -scheme "$SCHEME"             -configuration "$CONFIGURATION"             -sdk iphoneos             -destination 'generic/platform=iOS'             -derivedDataPath "$DERIVED_DATA"             -resultBundlePath "$BUILD_LOGS/CopilotChat.xcresult"             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO             CODE_SIGN_IDENTITY=""             DEVELOPMENT_TEAM=""             COMPILER_INDEX_STORE_ENABLE=NO             build             2>&1 | tee "$BUILD_LOGS/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRODUCTS_DIR="$DERIVED_DATA/Build/Products/$CONFIGURATION-iphoneos"
+          APP_PATH="$(find "$PRODUCTS_DIR" -maxdepth 1 -type d -name '*.app' -print -quit)"
+
+          if [[ -z "$APP_PATH" ]]; then
+            echo "::error::No .app bundle was found in $PRODUCTS_DIR"
+            find "$DERIVED_DATA/Build/Products" -maxdepth 3 -print | tee "$BUILD_LOGS/build-products-tree.log" || true
+            exit 1
+          fi
+
+          APP_NAME="$(basename "$APP_PATH")"
+          mkdir -p "$OUTPUT_DIR/Payload"
+          ditto "$APP_PATH" "$OUTPUT_DIR/Payload/$APP_NAME"
+
+          (
+            cd "$OUTPUT_DIR"
+            /usr/bin/zip -qry "CopilotChat-unsigned.ipa" Payload
+          )
+
+          {
+            echo "Packaged application: $APP_PATH"
+            echo "IPA: $OUTPUT_DIR/CopilotChat-unsigned.ipa"
+            echo
+            ls -lh "$OUTPUT_DIR/CopilotChat-unsigned.ipa"
+            echo
+            /usr/bin/unzip -l "$OUTPUT_DIR/CopilotChat-unsigned.ipa"
+          } | tee "$BUILD_LOGS/packaging.log"
+
+      - name: Extract compiler diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          touch "$BUILD_LOGS/xcodebuild.log"
+
+          {
+            echo "Compiler errors and warnings"
+            echo "Generated from the complete raw xcodebuild log."
+            echo
+            grep -nE '(^|[[:space:]])(error|warning|fatal error):' "$BUILD_LOGS/xcodebuild.log" || true
+          } | tee "$BUILD_LOGS/diagnostics-summary.log"
+
+      - name: Upload unsigned IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CopilotChat-unsigned-IPA
+          path: ${{ env.OUTPUT_DIR }}/CopilotChat-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CopilotChat-build-diagnostics-${{ github.run_number }}
+          path: |
+            ${{ env.BUILD_LOGS }}
+            ${{ env.DERIVED_DATA }}/Logs
+          if-no-files-found: warn
+          retention-days: 14
